@@ -1,0 +1,103 @@
+"""
+pid_controller.py
+-------------------
+Subscribes to /encoder_angle, computes a PID control output toward
+target_angle, and publishes the result as a PWM command to /motor_cmd.
+"""
+
+import rclpy
+from rclpy.node import Node
+from std_msgs.msg import Float32, Int32
+import time
+
+
+class PidController(Node):
+    def __init__(self):
+        super().__init__('pid_controller')
+
+        self.declare_parameter('target_angle', 90.0)
+        self.declare_parameter('kp', 2.0)
+        self.declare_parameter('ki', 0.0)
+        self.declare_parameter('kd', 0.0)
+        self.declare_parameter('min_stall_pwm', 45)
+        self.declare_parameter('deadband_deg', 1.5)
+        self.declare_parameter('integral_limit', 50.0)
+
+        self.target_angle   = self.get_parameter('target_angle').value
+        self.kp             = self.get_parameter('kp').value
+        self.ki             = self.get_parameter('ki').value
+        self.kd             = self.get_parameter('kd').value
+        self.min_stall_pwm  = self.get_parameter('min_stall_pwm').value
+        self.deadband_deg   = self.get_parameter('deadband_deg').value
+        self.integral_limit = self.get_parameter('integral_limit').value
+
+        self.get_logger().info(
+            f'PID controller started. target={self.target_angle}  '
+            f'Kp={self.kp} Ki={self.ki} Kd={self.kd}'
+        )
+
+        self.current_angle = None
+        self.integral = 0.0
+        self.prev_error = 0.0
+        self.prev_time = time.time()
+
+        self.cmd_publisher = self.create_publisher(Int32, '/motor_cmd', 10)
+        self.subscription = self.create_subscription(
+            Float32, '/encoder_angle', self.angle_callback, 10
+        )
+
+    def angle_callback(self, msg: Float32):
+        self.current_angle = msg.data
+
+        now = time.time()
+        dt = now - self.prev_time
+        if dt <= 0:
+            dt = 1e-3
+        self.prev_time = now
+
+        error = self.target_angle - self.current_angle
+
+        if abs(error) < self.deadband_deg:
+            self.send_pwm(0)
+            self.integral = 0.0
+            self.prev_error = error
+            return
+
+        self.integral += error * dt
+        self.integral = max(-self.integral_limit, min(self.integral_limit, self.integral))
+
+        derivative = (error - self.prev_error) / dt
+        self.prev_error = error
+
+        output = (self.kp * error) + (self.ki * self.integral) + (self.kd * derivative)
+
+        pwm = int(output)
+        if pwm > 0:
+            pwm += self.min_stall_pwm
+        elif pwm < 0:
+            pwm -= self.min_stall_pwm
+
+        pwm = max(-255, min(255, pwm))
+        self.send_pwm(pwm)
+
+    def send_pwm(self, value):
+        msg = Int32()
+        msg.data = int(value)
+        self.cmd_publisher.publish(msg)
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = PidController()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.send_pwm(0)
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
