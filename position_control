@@ -1,0 +1,120 @@
+/*
+  Activity 1: DC Motor + Encoder Position Control
+  -------------------------------------------------
+  Standalone version (no ROS) - drives the wheel to a fixed
+  target angle using a proportional controller, with a safety
+  limit so the motor never travels more than 360 degrees from
+  the zero reference position.
+
+  Hardware:
+    - ESP32 + TB6612FNG (or similar) motor driver
+    - DC motor with quadrature encoder
+*/
+
+#include <Arduino.h>
+
+// --- Pin Allocations ---
+constexpr uint8_t STBY = 27;
+constexpr uint8_t PWMA = 33;
+constexpr uint8_t AIN1 = 26;
+constexpr uint8_t AIN2 = 25;
+
+constexpr uint8_t ENCODER_C1 = 19;
+constexpr uint8_t ENCODER_C2 = 18;
+
+constexpr uint32_t MOTOR_FREQ = 500;   // 500 Hz PWM as required
+constexpr uint8_t  PWM_RES    = 8;
+
+// Measured: 2058 encoder ticks = one full 360 degree wheel rotation
+constexpr float TICKS_PER_REV = 2058.0f;
+
+// --- Control parameters ---
+float targetAngle = 90.0f;             // predefined target, can be changed via Serial
+constexpr float KP_POSITION   = 2.0f;
+constexpr int   MIN_STALL_PWM = 45;     // overcomes motor/gearbox static friction
+constexpr float DEADBAND_DEG  = 1.5f;
+
+volatile long encoderTicks = 0;
+
+void IRAM_ATTR readEncoder() {
+    int bState = digitalRead(ENCODER_C2);
+    if (bState == HIGH) encoderTicks++;
+    else                 encoderTicks--;
+}
+
+void driveMotor(int speed) {
+    if (speed > 0) {
+        digitalWrite(AIN1, LOW);
+        digitalWrite(AIN2, HIGH);
+    } else {
+        digitalWrite(AIN1, HIGH);
+        digitalWrite(AIN2, LOW);
+        speed = -speed;
+    }
+    speed = constrain(speed, 0, 255);
+    ledcWrite(PWMA, speed);
+}
+
+void setup() {
+    Serial.begin(115200);
+
+    pinMode(STBY, OUTPUT);
+    pinMode(AIN1, OUTPUT);
+    pinMode(AIN2, OUTPUT);
+    digitalWrite(STBY, HIGH);
+
+    pinMode(ENCODER_C1, INPUT_PULLUP);
+    pinMode(ENCODER_C2, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(ENCODER_C1), readEncoder, RISING);
+
+    ledcAttach(PWMA, MOTOR_FREQ, PWM_RES);
+    driveMotor(0);
+
+    Serial.println("Position control ready. Send a number over Serial to set a new target angle.");
+}
+
+void loop() {
+    // --- Allow changing the target angle from the PC ---
+    if (Serial.available() > 0) {
+        float newTarget = Serial.parseFloat();
+        if (newTarget != 0 || Serial.available() == 0) {
+            targetAngle = constrain(newTarget, 0.0f, 360.0f);  // never request beyond one revolution
+            Serial.print(">> New target angle: ");
+            Serial.println(targetAngle);
+        }
+    }
+
+    noInterrupts();
+    long ticks = encoderTicks;
+    interrupts();
+
+    float currentAngle = (ticks / TICKS_PER_REV) * 360.0f;
+
+    // --- Safety: never allow the wheel itself to exceed +-360 deg from zero ---
+    if (abs(currentAngle) > 360.0f) {
+        driveMotor(0);
+        Serial.println(">> SAFETY STOP: wheel exceeded 360 deg from reference!");
+        delay(500);
+        return;
+    }
+
+    float error = targetAngle - currentAngle;
+
+    if (abs(error) < DEADBAND_DEG) {
+        driveMotor(0);
+    } else {
+        int pwm = (int)(KP_POSITION * error);
+        if (pwm > 0) pwm += MIN_STALL_PWM;
+        else if (pwm < 0) pwm -= MIN_STALL_PWM;
+        pwm = constrain(pwm, -255, 255);
+        driveMotor(pwm);
+    }
+
+    static unsigned long lastPrint = 0;
+    if (millis() - lastPrint > 200) {
+        lastPrint = millis();
+        Serial.print("Target: "); Serial.print(targetAngle, 1);
+        Serial.print("  Current: "); Serial.print(currentAngle, 1);
+        Serial.print("  Error: "); Serial.println(error, 1);
+    }
+}
